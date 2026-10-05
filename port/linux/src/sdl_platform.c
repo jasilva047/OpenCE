@@ -17,6 +17,7 @@ and the debug keyboard that the game's console reads.
 #include "xiso.h"
 
 #include <SDL3/SDL.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -646,7 +647,7 @@ static void touch_refresh(int width, int height)
 			length = lx * lx + ly * ly;
 			if (length > 1.0f)
 			{
-				length = 1.0f / (float)SDL_sqrt(length);
+				length = 1.0f / sqrtf(length);
 				lx *= length;
 				ly *= length;
 			}
@@ -821,7 +822,7 @@ static void touch_draw(void)
 		if (fingers[index].role == TOUCH_ROLE_STICK)
 		{
 			float radius = TOUCH_STICK_RADIUS * u, dx = fingers[index].x - origin_x, dy = fingers[index].y - origin_y;
-			float length = (float)SDL_sqrt(dx * dx + dy * dy);
+			float length = sqrtf(dx * dx + dy * dy);
 
 			if (length > radius)
 			{
