@@ -832,6 +832,32 @@ static int controller_port(HANDLE device)
 	return -1;
 }
 
+#ifdef HALO_ANDROID
+/* the touch controls (sdl_platform.c) as the pad's buttons; the stick only
+overrides what is already there when pushed further */
+static void touch_gamepad(const struct platform_input_state *input, XINPUT_GAMEPAD *pad)
+{
+	unsigned int held = input->touch_buttons;
+	SHORT value;
+
+	if (held & TOUCH_FIRE) pad->bAnalogButtons[XINPUT_GAMEPAD_RIGHT_TRIGGER] = 0xff;
+	if (held & TOUCH_GRENADE) pad->bAnalogButtons[XINPUT_GAMEPAD_LEFT_TRIGGER] = 0xff;
+	if (held & TOUCH_JUMP) pad->bAnalogButtons[XINPUT_GAMEPAD_A] = 0xff;
+	if (held & TOUCH_MELEE) pad->bAnalogButtons[XINPUT_GAMEPAD_B] = 0xff;
+	if (held & TOUCH_RELOAD) pad->bAnalogButtons[XINPUT_GAMEPAD_X] = 0xff;
+	if (held & TOUCH_WEAPON) pad->bAnalogButtons[XINPUT_GAMEPAD_Y] = 0xff;
+	if (held & TOUCH_FLASHLIGHT) pad->bAnalogButtons[XINPUT_GAMEPAD_WHITE] = 0xff;
+	if (held & TOUCH_ZOOM) pad->wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+	if (held & TOUCH_CROUCH) pad->wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
+	if (held & TOUCH_START) pad->wButtons |= XINPUT_GAMEPAD_START;
+	if (held & TOUCH_BACK) pad->wButtons |= XINPUT_GAMEPAD_BACK;
+	value = (SHORT)(input->touch_lx * 32767.0f);
+	if (abs(value) > abs(pad->sThumbLX)) pad->sThumbLX = value;
+	value = (SHORT)(input->touch_ly * 32767.0f);
+	if (abs(value) > abs(pad->sThumbLY)) pad->sThumbLY = value;
+}
+#endif
+
 DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 {
 	int port = controller_port(device);
@@ -859,6 +885,10 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 			else
 				keyboard_controls(&input, &state->Gamepad);
 		}
+#ifdef HALO_ANDROID
+		if (!console_is_active())
+			touch_gamepad(&input, &state->Gamepad);
+#endif
 		if (port_gamepad(gamepads, count, 0))
 			sdl_gamepad_state(gamepads[0], &state->Gamepad);
 		test_input_gamepad(&state->Gamepad);

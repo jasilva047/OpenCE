@@ -27,7 +27,28 @@ struct platform_input_state
 	/* a menu is up (platform_menus_set_active): the keys drive the first
 	controller, to move about it, instead of the player's actions */
 	BOOL menus;
+	/* the touch controls (Android, sdl_platform.c): the buttons held, as
+	TOUCH_* bits, and the left stick, -1 to 1 with up positive */
+	unsigned int touch_buttons;
+	float touch_lx, touch_ly;
 };
+
+enum
+{
+	_touch_fire, _touch_grenade, _touch_jump, _touch_melee, _touch_reload, _touch_weapon, _touch_zoom,
+	_touch_crouch, _touch_flashlight, _touch_start, _touch_back, TOUCH_BUTTON_COUNT
+};
+#define TOUCH_FIRE (1u << _touch_fire)
+#define TOUCH_GRENADE (1u << _touch_grenade)
+#define TOUCH_JUMP (1u << _touch_jump)
+#define TOUCH_MELEE (1u << _touch_melee)
+#define TOUCH_RELOAD (1u << _touch_reload)
+#define TOUCH_WEAPON (1u << _touch_weapon)
+#define TOUCH_ZOOM (1u << _touch_zoom)
+#define TOUCH_CROUCH (1u << _touch_crouch)
+#define TOUCH_FLASHLIGHT (1u << _touch_flashlight)
+#define TOUCH_START (1u << _touch_start)
+#define TOUCH_BACK (1u << _touch_back)
 
 /* an input of the keyboard and mouse's controls (xinput_sdl.c): a scancode,
 a mouse button (INPUT_MOUSE + SDL_BUTTON_*), or the wheel */

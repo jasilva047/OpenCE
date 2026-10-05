@@ -33,6 +33,8 @@ static struct platform_input_state input_state;
 /* keys pressed since the last read, so a press and release between two
 reads still counts as a press (input injected on Android, or a slow frame) */
 static unsigned char keys_pressed[SDL_SCANCODE_COUNT];
+/* touch buttons pressed since the last read (a tap shorter than a poll still counts) */
+static unsigned int touch_buttons_pressed;
 /* likewise the mouse buttons pressed since the last read, so that a click
 quicker than a frame still counts */
 static unsigned char mouse_buttons_pressed[PLATFORM_MOUSE_BUTTON_COUNT];
@@ -531,6 +533,310 @@ void platform_display_apply(void)
 	SDL_GL_SetSwapInterval(config_boolean("display.vsync") ? 1 : 0);
 }
 
+#ifdef HALO_ANDROID
+/* ---------- touch controls
+
+The screen is a controller of its own: a floating stick under the first
+finger down on the left half, a drag on the right half to look (it adds to
+the mouse's motion, so aiming is direct), and the Xbox pad's buttons as
+squares. The buttons and the stick go to xinput_sdl.c (touch_gamepad)
+through platform_input_state; the squares are drawn here, with scissored
+clears (the game's renderer has no 2D path to borrow), just before the swap. */
+
+#define TOUCH_FINGERS 10
+#define TOUCH_STICK_RADIUS 1.6f /* in tenths of the screen's height */
+
+enum { TOUCH_ROLE_FREE, TOUCH_ROLE_BUTTON, TOUCH_ROLE_STICK, TOUCH_ROLE_LOOK };
+
+struct touch_finger
+{
+	SDL_FingerID id;
+	int role;
+	int button;
+	float x, y;
+};
+
+/* in the order of the TOUCH_* bits (sdl_platform.h). ax: 0 left, 1 centre,
+2 right; ay: 0 top, 1 bottom; x and y: the centre's distance from the
+anchor, inwards (centre: to the right), in tenths of the screen's height */
+static const struct
+{
+	signed char ax, ay;
+	float x, y, size;
+	const char *label;
+} touch_layout[TOUCH_BUTTON_COUNT] =
+{
+	{ 2, 1, 3.0f, 3.0f, 2.6f, "RT" },	/* fire */
+	{ 2, 1, 5.8f, 5.8f, 1.6f, "LT" },	/* grenade */
+	{ 2, 1, 6.0f, 1.5f, 1.6f, "A" },	/* jump, accept */
+	{ 2, 1, 1.0f, 5.8f, 1.6f, "B" },	/* melee, back */
+	{ 2, 1, 6.6f, 3.6f, 1.6f, "X" },	/* action, reload */
+	{ 2, 1, 3.0f, 6.2f, 1.6f, "Y" },	/* change weapon */
+	{ 2, 1, 1.1f, 8.0f, 1.4f, "Z" },	/* zoom (right stick click) */
+	{ 0, 1, 1.2f, 5.5f, 1.4f, "C" },	/* crouch (left stick click) */
+	{ 0, 1, 1.2f, 7.4f, 1.4f, "F" },	/* flashlight (white) */
+	{ 1, 0, 1.0f, 1.0f, 1.2f, "S" },	/* start */
+	{ 1, 0, -1.0f, 1.0f, 1.2f, "K" },	/* back */
+};
+
+/* 3x5 letters, a row to each of five 3-bit values, left bit first */
+static const struct { char letter; unsigned char rows[5]; } touch_font[] =
+{
+	{ 'A', { 2, 5, 7, 5, 5 } }, { 'B', { 6, 5, 6, 5, 6 } }, { 'C', { 3, 4, 4, 4, 3 } },
+	{ 'F', { 7, 4, 6, 4, 4 } }, { 'K', { 5, 5, 6, 5, 5 } }, { 'L', { 4, 4, 4, 4, 7 } },
+	{ 'R', { 6, 5, 6, 5, 5 } }, { 'S', { 3, 4, 2, 1, 6 } }, { 'T', { 7, 2, 2, 2, 2 } },
+	{ 'X', { 5, 5, 2, 5, 5 } }, { 'Y', { 5, 5, 2, 2, 2 } }, { 'Z', { 7, 1, 2, 4, 7 } },
+};
+
+static struct touch_finger touch_fingers[TOUCH_FINGERS];
+static float touch_stick_origin_x, touch_stick_origin_y;
+
+static void touch_button_rect(int button, int width, int height, float *x, float *y, float *size)
+{
+	float u = height / 10.0f;
+	float cx, cy;
+
+	if (touch_layout[button].ax == 0)
+		cx = touch_layout[button].x * u;
+	else if (touch_layout[button].ax == 1)
+		cx = width * 0.5f + touch_layout[button].x * u;
+	else
+		cx = width - touch_layout[button].x * u;
+	cy = touch_layout[button].ay == 0 ? touch_layout[button].y * u : height - touch_layout[button].y * u;
+	*size = touch_layout[button].size * u;
+	*x = cx - *size * 0.5f;
+	*y = cy - *size * 0.5f;
+}
+
+/* the button under a point, a little generously, or -1 */
+static int touch_button_at(float px, float py, int width, int height)
+{
+	int button;
+
+	for (button = 0; button < TOUCH_BUTTON_COUNT; button++)
+	{
+		float x, y, size, pad;
+
+		touch_button_rect(button, width, height, &x, &y, &size);
+		pad = size * 0.15f;
+		if (px >= x - pad && px < x + size + pad && py >= y - pad && py < y + size + pad)
+			return button;
+	}
+	return -1;
+}
+
+/* the buttons held and the stick, from the fingers down (input_lock held) */
+static void touch_refresh(int width, int height)
+{
+	unsigned int held = 0;
+	float lx = 0.0f, ly = 0.0f, radius = TOUCH_STICK_RADIUS * height / 10.0f;
+	int index;
+
+	(void)width;
+	for (index = 0; index < TOUCH_FINGERS; index++)
+	{
+		if (touch_fingers[index].role == TOUCH_ROLE_BUTTON)
+			held |= 1u << touch_fingers[index].button;
+		else if (touch_fingers[index].role == TOUCH_ROLE_STICK)
+		{
+			float length;
+
+			lx = (touch_fingers[index].x - touch_stick_origin_x) / radius;
+			ly = -(touch_fingers[index].y - touch_stick_origin_y) / radius;
+			length = lx * lx + ly * ly;
+			if (length > 1.0f)
+			{
+				length = 1.0f / (float)SDL_sqrt(length);
+				lx *= length;
+				ly *= length;
+			}
+		}
+	}
+	touch_buttons_pressed |= held & ~input_state.touch_buttons;
+	input_state.touch_buttons = held;
+	input_state.touch_lx = lx;
+	input_state.touch_ly = ly;
+}
+
+static void touch_event(const SDL_Event *event)
+{
+	int width, height, index, slot = -1;
+	float x, y;
+	SDL_FingerID id = event->tfinger.fingerID;
+
+	if (!platform_window)
+		return;
+	SDL_GetWindowSizeInPixels(platform_window, &width, &height);
+	if (width <= 0 || height <= 0)
+		return;
+	x = event->tfinger.x * width;
+	y = event->tfinger.y * height;
+	for (index = 0; index < TOUCH_FINGERS; index++)
+	{
+		if (touch_fingers[index].role != TOUCH_ROLE_FREE && touch_fingers[index].id == id)
+			slot = index;
+	}
+	switch (event->type)
+	{
+	case SDL_EVENT_FINGER_DOWN:
+		if (slot < 0)
+		{
+			BOOL stick_down = FALSE;
+			int button;
+
+			for (index = 0; index < TOUCH_FINGERS; index++)
+			{
+				if (touch_fingers[index].role == TOUCH_ROLE_STICK)
+					stick_down = TRUE;
+				if (slot < 0 && touch_fingers[index].role == TOUCH_ROLE_FREE)
+					slot = index;
+			}
+			if (slot < 0)
+				break;
+			touch_fingers[slot].id = id;
+			touch_fingers[slot].x = x;
+			touch_fingers[slot].y = y;
+			button = touch_button_at(x, y, width, height);
+			if (button >= 0)
+			{
+				touch_fingers[slot].role = TOUCH_ROLE_BUTTON;
+				touch_fingers[slot].button = button;
+			}
+			else if (x < width * 0.5f && !stick_down)
+			{
+				touch_fingers[slot].role = TOUCH_ROLE_STICK;
+				touch_stick_origin_x = x;
+				touch_stick_origin_y = y;
+			}
+			else
+				touch_fingers[slot].role = TOUCH_ROLE_LOOK;
+		}
+		break;
+	case SDL_EVENT_FINGER_MOTION:
+		if (slot >= 0)
+		{
+			if (touch_fingers[slot].role == TOUCH_ROLE_LOOK)
+			{
+				input_state.mouse_dx += event->tfinger.dx * width;
+				input_state.mouse_dy += event->tfinger.dy * height;
+			}
+			touch_fingers[slot].x = x;
+			touch_fingers[slot].y = y;
+		}
+		break;
+	case SDL_EVENT_FINGER_UP:
+	case SDL_EVENT_FINGER_CANCELED:
+		if (slot >= 0)
+			touch_fingers[slot].role = TOUCH_ROLE_FREE;
+		break;
+	}
+	touch_refresh(width, height);
+}
+
+static void touch_fill(int window_height, float x, float y, float width, float height)
+{
+	int w = (int)(width + 0.5f), h = (int)(height + 0.5f);
+
+	if (w < 1 || h < 1)
+		return;
+	glScissor((GLint)x, (GLint)(window_height - y - height), (GLsizei)w, (GLsizei)h);
+	glClear(GL_COLOR_BUFFER_BIT);
+}
+
+static void touch_outline(int window_height, float x, float y, float size, float thickness)
+{
+	touch_fill(window_height, x, y, size, thickness);
+	touch_fill(window_height, x, y + size - thickness, size, thickness);
+	touch_fill(window_height, x, y, thickness, size);
+	touch_fill(window_height, x + size - thickness, y, thickness, size);
+}
+
+static void touch_label(int window_height, float x, float y, float size, const char *label)
+{
+	float pixel = size * 0.08f;
+	int count = (int)strlen(label), letter, row, column, font;
+	float left = x + (size - (count * 4 - 1) * pixel) * 0.5f, top = y + (size - 5 * pixel) * 0.5f;
+
+	if (pixel < 2.0f)
+		pixel = 2.0f;
+	for (letter = 0; letter < count; letter++)
+	{
+		for (font = 0; font < (int)(sizeof(touch_font) / sizeof(touch_font[0])); font++)
+		{
+			if (touch_font[font].letter != label[letter])
+				continue;
+			for (row = 0; row < 5; row++)
+			{
+				for (column = 0; column < 3; column++)
+				{
+					if (touch_font[font].rows[row] & (4 >> column))
+						touch_fill(window_height, left + (letter * 4 + column) * pixel, top + row * pixel, pixel, pixel);
+				}
+			}
+		}
+	}
+}
+
+/* the squares and the stick over the frame just drawn; the renderer starts
+every frame from a cleared state (xgpu_gl_state_invalidate after the swap) */
+static void touch_draw(void)
+{
+	struct touch_finger fingers[TOUCH_FINGERS];
+	unsigned int held;
+	float origin_x, origin_y;
+	int width, height, button, index;
+	float u;
+
+	pthread_mutex_lock(&input_lock);
+	memcpy(fingers, touch_fingers, sizeof(fingers));
+	held = input_state.touch_buttons;
+	origin_x = touch_stick_origin_x;
+	origin_y = touch_stick_origin_y;
+	pthread_mutex_unlock(&input_lock);
+	platform_video_drawable_size(&width, &height);
+	if (width <= 0 || height <= 0)
+		return;
+	u = height / 10.0f;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glEnable(GL_SCISSOR_TEST);
+	for (button = 0; button < TOUCH_BUTTON_COUNT; button++)
+	{
+		float x, y, size;
+		BOOL down = (held & (1u << button)) != 0;
+
+		touch_button_rect(button, width, height, &x, &y, &size);
+		glClearColor(0.85f, 0.85f, 0.85f, 1.0f);
+		if (down)
+		{
+			touch_fill(height, x, y, size, size);
+			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		}
+		else
+			touch_outline(height, x, y, size, u * 0.06f > 2.0f ? u * 0.06f : 2.0f);
+		touch_label(height, x, y, size, touch_layout[button].label);
+	}
+	for (index = 0; index < TOUCH_FINGERS; index++)
+	{
+		if (fingers[index].role == TOUCH_ROLE_STICK)
+		{
+			float radius = TOUCH_STICK_RADIUS * u, dx = fingers[index].x - origin_x, dy = fingers[index].y - origin_y;
+			float length = (float)SDL_sqrt(dx * dx + dy * dy);
+
+			if (length > radius)
+			{
+				dx *= radius / length;
+				dy *= radius / length;
+			}
+			glClearColor(0.85f, 0.85f, 0.85f, 1.0f);
+			touch_outline(height, origin_x - radius, origin_y - radius, radius * 2.0f, 2.0f);
+			touch_fill(height, origin_x + dx - u * 0.4f, origin_y + dy - u * 0.4f, u * 0.8f, u * 0.8f);
+		}
+	}
+	glDisable(GL_SCISSOR_TEST);
+}
+#endif
+
 void platform_video_drawable_size(int *width, int *height)
 {
 	SDL_GetWindowSizeInPixels(platform_window, width, height);
@@ -574,6 +880,9 @@ void platform_video_swap(void)
 	static Uint64 next_frame;
 	Uint64 interval, now;
 
+#endif
+#ifdef HALO_ANDROID
+	touch_draw();
 #endif
 	SDL_GL_SwapWindow(platform_window);
 #ifndef HALO_ANDROID
@@ -989,6 +1298,14 @@ void platform_pump_events(void)
 			}
 #endif
 			break;
+#ifdef HALO_ANDROID
+		case SDL_EVENT_FINGER_DOWN:
+		case SDL_EVENT_FINGER_MOTION:
+		case SDL_EVENT_FINGER_UP:
+		case SDL_EVENT_FINGER_CANCELED:
+			touch_event(&event);
+			break;
+#endif
 		case SDL_EVENT_MOUSE_MOTION:
 #ifndef HALO_ANDROID
 			/* in the menus the mouse moves the pointer, not the view */
@@ -1255,6 +1572,8 @@ void platform_input_read(struct platform_input_state *state, BOOL consume_motion
 			state->mouse_buttons[scancode] |= mouse_buttons_pressed[scancode];
 			mouse_buttons_pressed[scancode] = 0;
 		}
+		state->touch_buttons |= touch_buttons_pressed;
+		touch_buttons_pressed = 0;
 	}
 	if (consume_motion)
 	{
